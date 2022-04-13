@@ -39,7 +39,12 @@
 #ifndef _GNU_SOURCE
 # define _GNU_SOURCE
 #endif
+#ifdef HAVE_LINUX_TCP_H
+#include <linux/tcp.h>
+#else
 #include <netinet/tcp.h>
+#endif
+#include <net/if.h> // for IFNAMSIZ
 
 #if defined(HAVE_CPUSET_SETAFFINITY)
 #include <sys/param.h>
@@ -74,7 +79,7 @@ typedef uint64_t iperf_size_t;
 
 struct iperf_interval_results
 {
-    iperf_size_t bytes_transferred; /* bytes transfered in this interval */
+    iperf_size_t bytes_transferred; /* bytes transferred in this interval */
     struct iperf_time interval_start_time;
     struct iperf_time interval_end_time;
     float     interval_duration;
@@ -99,6 +104,7 @@ struct iperf_interval_results
     int interval_retrans;
     int interval_sacks;
     int snd_cwnd;
+    int snd_wnd;
     TAILQ_ENTRY(iperf_interval_results) irlistentries;
     void     *custom_data;
     int rtt;
@@ -122,6 +128,7 @@ struct iperf_stream_result
     int stream_sum_rtt;
     int stream_count_rtt;
     int stream_max_snd_cwnd;
+    int stream_max_snd_wnd;
     struct iperf_time start_time;
     struct iperf_time end_time;
     struct iperf_time start_time_fixed;
@@ -139,7 +146,7 @@ struct iperf_settings
     int       blksize;              /* size of read/writes (-l) */
     iperf_size_t  rate;                 /* target data rate for application pacing*/
     iperf_size_t  bitrate_limit;   /* server's maximum allowed total data rate for all streams*/
-    double        bitrate_limit_interval;  /* interval for avaraging total data rate */
+    double        bitrate_limit_interval;  /* interval for averaging total data rate */
     int           bitrate_limit_stats_per_interval;     /* calculated number of stats periods for averaging total data rate */
     uint64_t  fqrate;               /* target data rate for FQ pacing*/
     int	      pacing_timer;	    /* pacing timer in microseconds */
@@ -152,6 +159,7 @@ struct iperf_settings
     iperf_size_t blocks;            /* number of blocks (packets) to send */
     char      unit_format;          /* -f */
     int       num_ostreams;         /* SCTP initmsg settings */
+    int       dont_fragment;        /* Whether to set IP flag Do-Not_Fragment */
 #if defined(HAVE_SSL)
     char      *authtoken;           /* Authentication token */
     char      *client_username;
@@ -159,6 +167,8 @@ struct iperf_settings
     EVP_PKEY  *client_rsa_pubkey;
 #endif // HAVE_SSL
     int	      connect_timeout;	    /* socket connection timeout, in ms */
+    int       idle_timeout;         /* server idle time timeout */
+    struct iperf_time rcv_timeout;  /* Timeout for receiving messages in active mode, in us */
 };
 
 struct iperf_test;
@@ -173,7 +183,7 @@ struct iperf_stream
     int       socket;
     int       id;
     int       sender;
-	/* XXX: is settings just a pointer to the same struct in iperf_test? if not, 
+	/* XXX: is settings just a pointer to the same struct in iperf_test? if not,
 		should it be? */
     struct iperf_settings *settings;	/* pointer to structure settings */
 
@@ -183,6 +193,7 @@ struct iperf_stream
     int       green_light;
     int       buffer_fd;	/* data to send, file descriptor */
     char      *buffer;		/* data to send, mmapped */
+    int       pending_size;     /* pending data to send */
     int       diskfile_fd;	/* file to send, file descriptor */
     int	      diskfile_left;	/* remaining file data on disk */
 
@@ -257,6 +268,7 @@ struct iperf_test
     char     *server_hostname;                  /* -c option */
     char     *tmp_template;
     char     *bind_address;                     /* first -B option */
+    char     *bind_dev;                         /* bind to network device */
     TAILQ_HEAD(xbind_addrhead, xbind_entry) xbind_addrs; /* all -X opts */
     int       bind_port;                        /* --cport option */
     int       server_port;
@@ -286,6 +298,7 @@ struct iperf_test
 #if defined(HAVE_SSL)
     char      *server_authorized_users;
     EVP_PKEY  *server_rsa_private_key;
+    int       server_skew_threshold;
 #endif // HAVE_SSL
 
     /* boolean variables for Options */
@@ -312,7 +325,7 @@ struct iperf_test
     fd_set    read_set;                         /* set of read sockets */
     fd_set    write_set;                        /* set of write sockets */
 
-    /* Interval related members */ 
+    /* Interval related members */
     int       omitting;
     double    stats_interval;
     double    reporter_interval;
@@ -337,8 +350,13 @@ struct iperf_test
 
     iperf_size_t bitrate_limit_stats_count;               /* Number of stats periods accumulated for server's total bitrate average */
     iperf_size_t *bitrate_limit_intervals_traffic_bytes;  /* Pointer to a cyclic array that includes the last interval's bytes transferred */
-    iperf_size_t bitrate_limit_last_interval_index;       /* Index of the last interval traffic insrted into the cyclic array */
+    iperf_size_t bitrate_limit_last_interval_index;       /* Index of the last interval traffic inserted into the cyclic array */
     int          bitrate_limit_exceeded;                  /* Set by callback routine when average data rate exceeded the server's bitrate limit */
+
+    int server_last_run_rc;                      /* Save last server run rc for next test */
+    uint server_forced_idle_restarts_count;      /* count number of forced server restarts to make sure it is not stack */
+    uint server_forced_no_msg_restarts_count;    /* count number of forced server restarts to make sure it is not stack */
+    uint server_test_number;                     /* count number of tests performed by a server */
 
     char      cookie[COOKIE_SIZE];
 //    struct iperf_stream *streams;               /* pointer to list of struct stream */
@@ -372,6 +390,8 @@ struct iperf_test
 /* default settings */
 #define PORT 5201  /* default port to listen on (don't use the same port as iperf2) */
 #define uS_TO_NS 1000
+#define mS_TO_US 1000
+#define SEC_TO_mS 1000
 #define SEC_TO_US 1000000LL
 #define UDP_RATE (1024 * 1024) /* 1 Mbps */
 #define OMIT 0 /* seconds */
